@@ -1,4 +1,3 @@
-from airflow.hooks.S3_hook import S3Hook
 from airflow.plugins_manager import AirflowPlugin
 from airflow.models import BaseOperator
 from snowflake_plugin.hooks.snowflake_hook import SnowflakeHook
@@ -6,8 +5,13 @@ from airflow.version import version as airflow_version
 from airflow.exceptions import AirflowException
 
 
+# If quote_object_identifiers is False,
+# the dbname, schema and table will all be uppercased.
+# Otherwise, the identifiers will be used as-is and the caller is responsible for uppercasing whichever ones are necessary.
+
+# Note: this assumes that an S3 stage is already set in Snowflake.
 class S3ToSnowflakeOperator(BaseOperator):
-    template_fields = ('s3_key', 'etl_batch_tag')
+    template_fields = ()  # Needs to be a tuple or list, e.g. ('foobar', )
 
     base_delete_batch = """
       DELETE FROM {snowflake_destination}
@@ -17,7 +21,7 @@ class S3ToSnowflakeOperator(BaseOperator):
     base_copy = """
         COPY INTO {snowflake_destination}
         FROM (SELECT '{etl_batch_tag}' as etl_batch_tag, {columns_sql}
-          FROM '@{db_prefixes}{stage_name}/{s3_key}')
+          FROM '@{stage_name}/{s3_key}')
         FORCE=TRUE
     """
 
@@ -25,34 +29,32 @@ class S3ToSnowflakeOperator(BaseOperator):
     format_type = 'TYPE={_type}'
 
     def __init__(self,
-                 s3_bucket,
-                 s3_key,
-                 etl_batch_tag,
                  database,
                  schema,
                  table,
                  s3_conn_id,
                  snowflake_conn_id,
-                 file_format_name='JSON',
-                 custom_format_name=None,
                  csv_column_count=None,
                  stage_name=None,
+                 quote_object_identifiers=False,
                  *args, **kwargs):
 
         super(S3ToSnowflakeOperator, self).__init__(*args, **kwargs)
-        self.s3_bucket = s3_bucket
-        self.s3_key = s3_key
-        self.etl_batch_tag = etl_batch_tag
+
+        # print ('************ KWARGS **************')
+        # print (kwargs)
+
         self.database = database
         self.schema = schema
         self.table = table
         self.s3_conn_id = s3_conn_id
         self.snowflake_conn_id = snowflake_conn_id
-        self.file_format_name = file_format_name
-        self.custom_format_name = custom_format_name
         self.csv_column_count = csv_column_count
         self.stage_name = stage_name
 
+        # If quote_object_identifiers is false, we'll uppercase everything else.
+        self.quote_object_identifiers = quote_object_identifiers
+        self.quote_char = '"' if quote_object_identifiers else ''
 
     def build_delete_batch(self):
       fmt_args = {
@@ -64,65 +66,56 @@ class S3ToSnowflakeOperator(BaseOperator):
 
     def get_db_prefixes(self):
       prefixes = ''
-      if self.database:
-        prefixes += f'{self.database}.'
 
+      # e.g. '"mydb."'. or 'mydb.'
+      if self.database:
+        prefixes += f'{self.quote_char}{self.database}{self.quote_char}.'
+
+      # e.g. '"myschema"'. or 'myschema.'
       if self.schema:
-        prefixes += f'{self.schema}.'
+        prefixes += f'{self.quote_char}{self.schema}{self.quote_char}.'
 
       return prefixes
 
+
     def get_snowflake_destination(self):
-      return self.get_db_prefixes() + self.table
+      destination = self.get_db_prefixes() + self.table
+
+      if not self.quote_object_identifiers:
+        destination = destination.upper()
+
+      return destination
 
 
     def build_copy(self):
-        s3_hook = S3Hook(self.s3_conn_id)
-        if hasattr(s3_hook,'get_credentials'):
-            a_key , s_key, token = s3_hook.get_credentials()
-        elif hasattr(s3_hook,'_get_credentials'):
-            a_key , s_key, _ ,_= s3_hook._get_credentials(region_name=None)
-        else:
-            raise AirflowException('{0} does not support airflow v{1}'.format(self.__class__.__name__,airflow_version))
+      columns = [f'${i}' for i in range(1, self.csv_column_count + 1)]
+      columns_sql = ', '.join(columns)
 
+      fmt_args = {
+        'snowflake_destination': self.get_snowflake_destination(),
+        'etl_batch_tag': self.etl_batch_tag,
+        'columns_sql': columns_sql,
+        'stage_name': self.stage_name,
+        's3_key': self.s3_key,
+      }
 
-        file_format = None
-        if self.custom_format_name:
-          file_format = self.custom_format.format(custom_format=self.custom_format_name)
-        else:
-          file_format = self.format_type.format(_type=self.file_format_name)
+      return self.base_copy.format(**fmt_args)
 
-        columns = [f'${i}' for i in range(1, self.csv_column_count + 1)]
-        columns_sql = ', '.join(columns)
-
-        fmt_args = {
-            'snowflake_destination': self.get_snowflake_destination(),
-            'etl_batch_tag': self.etl_batch_tag,
-            'columns_sql': columns_sql,
-            'stage_name': self.stage_name,
-            's3_bucket': self.s3_bucket,
-            's3_key': self.s3_key,
-            'aws_access_key_id': a_key,
-            'aws_secret_access_key': s_key,
-            'file_format': file_format,
-            'db_prefixes': self.get_db_prefixes(),
-        }
-
-        return self.base_copy.format(**fmt_args)
 
     def execute(self, context):
-        sf_hook = SnowflakeHook(snowflake_conn_id=self.snowflake_conn_id).get_conn()
-        # import ipdb; ipdb.set_trace()
+      self.s3_key = context['task_instance'].xcom_pull(key='s3_key', task_ids='lambda_amplitude_to_s3')
+      self.etl_batch_tag = self.s3_key.split('/')[-1]
 
-        # import logging
-        # logging.getLogger('snowflake.connector.connection').setLevel(logging.DEBUG)
+      print (f'Executing S3 to Snowflake: s3_key={self.s3_key}, stage={self.stage_name}, destination={self.get_snowflake_destination()}, etl_batch_tag={self.etl_batch_tag}')
 
-        delete_batch_sql = self.build_delete_batch()
-        print (delete_batch_sql)
-        sf_hook.cursor().execute(delete_batch_sql)
-        print (f'Finished deleting events with etl_batch_tag={self.etl_batch_tag}.')
+      sf_hook = SnowflakeHook(snowflake_conn_id=self.snowflake_conn_id).get_conn()
 
-        copy_sql = self.build_copy()
-        print (copy_sql)
-        sf_hook.cursor().execute(copy_sql)
-        print (f'Finished copying events with etl_batch_tag={self.etl_batch_tag}.')
+      delete_batch_sql = self.build_delete_batch()
+      print (delete_batch_sql)
+      sf_hook.cursor().execute(delete_batch_sql)
+      print (f'Finished deleting events with etl_batch_tag={self.etl_batch_tag}.')
+
+      copy_sql = self.build_copy()
+      print (copy_sql)
+      sf_hook.cursor().execute(copy_sql)
+      print (f'Finished copying events with etl_batch_tag={self.etl_batch_tag}.')
